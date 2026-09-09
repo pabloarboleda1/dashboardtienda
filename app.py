@@ -26,6 +26,7 @@ Cómo ejecutar:
 """
 
 import io
+import json
 import re
 import unicodedata
 import zipfile
@@ -846,22 +847,173 @@ def construir_contexto_periodo(periodo, datos, incluir_pedidos=True):
     return "\n".join(partes)
 
 
-def preguntar_ia(pregunta, contexto, api_key, historial=None):
+def definir_herramientas_ia():
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "consultar_pedidos",
+                "description": "Busca pedidos reales en Consignaciones. Úsala para preguntas sobre fechas, canales, valores o descripciones específicas de pedidos.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "periodo": {"type": "string", "description": "Ej: 'Jun 2026'. Si se omite, busca en todos los periodos seleccionados."},
+                        "canal": {"type": "string", "description": "Filtra por canal/medio de pago. Acepta 'Online', 'Física' o el valor literal (ej. 'En línea', 'Consignación')."},
+                        "producto_contiene": {"type": "string", "description": "Texto a buscar dentro de la descripción del pedido."},
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "consultar_inventario",
+                "description": "Consulta el catálogo de Inventario: costos, precios, unidades vendidas por canal, inventario final y utilidad por producto.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "periodo": {"type": "string", "description": "Ej: 'Jun 2026'. Si se omite, usa todos los periodos seleccionados."},
+                        "producto_contiene": {"type": "string", "description": "Texto a buscar en el nombre del producto."},
+                        "solo_con_ventas": {"type": "boolean", "description": "Si es true, solo devuelve productos con unidades vendidas > 0."},
+                    },
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "consultar_retribucion_fondo",
+                "description": "Consulta el detalle de retribución al Fondo de Empleados por producto y periodo.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "periodo": {"type": "string", "description": "Ej: 'Jun 2026'. Si se omite, usa todos los periodos seleccionados."},
+                    },
+                },
+            },
+        },
+    ]
+
+
+def _periodos_objetivo(args, periodos_seleccionados):
+    p = args.get("periodo")
+    return [p] if p else list(periodos_seleccionados)
+
+
+def _mapear_canal(canal):
+    """Traduce sinónimos comunes en español/inglés a los valores reales de Medio_Pago."""
+    if not canal:
+        return canal
+    c = canal.strip().lower()
+    equivalencias = {
+        "online": "en linea", "en línea": "en linea", "en linea": "en linea",
+        "física": "consignaci", "fisica": "consignaci", "tienda física": "consignaci",
+    }
+    return equivalencias.get(c, canal)
+
+
+def ejecutar_herramienta_ia(nombre, args, periodos_seleccionados, datos_por_periodo):
+    periodos = [p for p in _periodos_objetivo(args, periodos_seleccionados) if p in datos_por_periodo]
+    if not periodos:
+        return json.dumps({"error": "periodo no encontrado entre los seleccionados"})
+
+    if nombre == "consultar_pedidos":
+        partes = []
+        for p in periodos:
+            df = datos_por_periodo[p]["consignaciones"].copy()
+            if args.get("canal"):
+                df = df[df["Medio_Pago"].str.contains(_mapear_canal(args["canal"]), case=False, na=False)]
+            if args.get("producto_contiene"):
+                df = df[df["Descripcion"].str.contains(args["producto_contiene"], case=False, na=False)]
+            partes.append(df)
+        resultado = pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
+        if resultado.empty:
+            return json.dumps({"resultados": []})
+        resultado = resultado[["Fecha_Pago", "Medio_Pago", "Descripcion", "Valor_Mercancia", "Consignacion_Neto"]].head(60).copy()
+        resultado["Fecha_Pago"] = resultado["Fecha_Pago"].dt.strftime("%d/%m/%Y")
+        return json.dumps({"resultados": json.loads(resultado.to_json(orient="records", force_ascii=False))})
+
+    if nombre == "consultar_inventario":
+        partes = []
+        for p in periodos:
+            df = datos_por_periodo[p]["inventario"].copy()
+            if df is None or df.empty:
+                continue
+            df["Periodo"] = p
+            if args.get("producto_contiene"):
+                df = df[df["Producto"].str.contains(args["producto_contiene"], case=False, na=False)]
+            if args.get("solo_con_ventas"):
+                df = df[df["Total_Vendido"] > 0]
+            partes.append(df)
+        resultado = pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
+        if resultado.empty:
+            return json.dumps({"resultados": []})
+        cols = ["Periodo", "Producto", "Compra_Origen", "Costo_Unitario", "Precio_Venta_Unitario",
+                "Cantidad_Fisica", "Cantidad_Online", "Cantidad_Nomina", "Total_Vendido",
+                "Ingresos_Totales", "Inventario_Final", "Utilidad_Bruta"]
+        return json.dumps({"resultados": json.loads(resultado[cols].head(80).to_json(orient="records", force_ascii=False))})
+
+    if nombre == "consultar_retribucion_fondo":
+        partes = []
+        for p in periodos:
+            r = datos_por_periodo[p]["retribucion"].copy()
+            if r is None or r.empty:
+                continue
+            r["Periodo"] = p
+            partes.append(r)
+        resultado = pd.concat(partes, ignore_index=True) if partes else pd.DataFrame()
+        if resultado.empty:
+            return json.dumps({"resultados": [], "total_a_retribuir": 0})
+        cols = ["Periodo", "Producto", "Categoria", "Total_Vendido", "Tasa", "Retribucion"]
+        return json.dumps({
+            "resultados": json.loads(resultado[cols].to_json(orient="records", force_ascii=False)),
+            "total_a_retribuir": float(resultado["Retribucion"].sum(skipna=True)),
+        })
+
+    return json.dumps({"error": f"herramienta desconocida: {nombre}"})
+
+
+def preguntar_ia_con_herramientas(pregunta, api_key, periodos_seleccionados, datos_por_periodo, historial=None):
     cliente = Groq(api_key=api_key)
     mensajes = [{
         "role": "system",
         "content": (
-            "Eres un analista de datos para la Tienda Virtual UCN. Respondes preguntas sobre las "
-            "ventas, inventario y retribución al Fondo de Empleados, basándote únicamente en los datos "
-            "que se te entregan. Si algo no está en los datos, dilo claramente en vez de inventar. "
+            "Eres un analista de datos para la Tienda Virtual UCN. Tienes herramientas para consultar "
+            "pedidos, inventario y retribución al Fondo de Empleados con precisión — úsalas en vez de adivinar "
+            "cifras. Si una consulta no devuelve resultados, dilo claramente en vez de inventar. "
             "Responde en español, de forma breve y directa."
         ),
     }]
     if historial:
         mensajes.extend(historial)
-    mensajes.append({"role": "user", "content": f"DATOS:\n{contexto}\n\nPREGUNTA: {pregunta}"})
-    respuesta = cliente.chat.completions.create(model=MODELO_GROQ, messages=mensajes, temperature=0.3, max_tokens=800)
-    return respuesta.choices[0].message.content
+    mensajes.append({"role": "user", "content": pregunta})
+
+    herramientas = definir_herramientas_ia()
+    for _ in range(5):
+        respuesta = cliente.chat.completions.create(
+            model=MODELO_GROQ, messages=mensajes, tools=herramientas, tool_choice="auto",
+            temperature=0.2, max_tokens=800,
+        )
+        msg = respuesta.choices[0].message
+        if not msg.tool_calls:
+            return msg.content
+        mensajes.append({
+            "role": "assistant",
+            "content": msg.content or "",
+            "tool_calls": [
+                {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                for tc in msg.tool_calls
+            ],
+        })
+        for tc in msg.tool_calls:
+            try:
+                args = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            resultado = ejecutar_herramienta_ia(tc.function.name, args, periodos_seleccionados, datos_por_periodo)
+            mensajes.append({"role": "tool", "tool_call_id": tc.id, "content": resultado})
+
+    return "No pude completar la consulta después de varios intentos — intenta reformular la pregunta."
 
 
 def generar_resumen_ia(periodo, contexto, api_key):
@@ -1259,6 +1411,127 @@ else:
         st.caption("Los productos 'Sin categorizar' no calzan con Camiseta/Chaqueta/Chompa/Gorra y no se incluyen en el total.")
 
 # --------------------------------------------------------------
+# COSTOS Y UTILIDAD (INVENTARIO)
+# --------------------------------------------------------------
+st.write("")
+st.markdown('<div class="section-title">Costos y Utilidad (Inventario)</div>', unsafe_allow_html=True)
+
+partes_inv = []
+for periodo in periodos_seleccionados:
+    dfi = datos_por_periodo[periodo]["inventario"]
+    if dfi is not None and not dfi.empty:
+        dfi_p = dfi.copy()
+        dfi_p["Periodo"] = periodo
+        partes_inv.append(dfi_p)
+
+if not partes_inv:
+    st.caption("No hay datos de Inventario disponibles para los periodos seleccionados.")
+else:
+    df_inv_filtrado = pd.concat(partes_inv, ignore_index=True)
+    costo_total = df_inv_filtrado["Costo_Total_Compra"].sum()
+    ingresos_inv = df_inv_filtrado["Ingresos_Totales"].sum()
+    utilidad_total = df_inv_filtrado["Utilidad_Bruta"].sum()
+    margen_inv = (utilidad_total / ingresos_inv * 100) if ingresos_inv else 0
+
+    col_c1, col_c2, col_c3, col_c4 = st.columns(4)
+    render_kpi(col_c1, "Costo Total Compra", formato_pesos(costo_total), ACENTO_BRUTO)
+    render_kpi(col_c2, "Ingresos (Inventario)", formato_pesos(ingresos_inv), ACENTO_INGRESOS)
+    render_kpi(col_c3, "Utilidad Bruta", formato_pesos(utilidad_total), ACENTO_UNIDADES if utilidad_total >= 0 else ACENTO_ALERTA)
+    render_kpi(col_c4, "Margen sobre Ingresos", f"{margen_inv:,.1f}%".replace(",", "X").replace(".", ",").replace("X", "."), ACENTO_PEDIDOS)
+
+    st.write("")
+    vendidos = df_inv_filtrado[df_inv_filtrado["Total_Vendido"] > 0].copy()
+    if vendidos.empty:
+        st.caption("Ningún producto registra unidades vendidas en Inventario para este filtro.")
+    else:
+        top_rentabilidad = (
+            vendidos.groupby("Producto", as_index=False)
+            .agg(Unidades=("Total_Vendido", "sum"), Costo_Unitario=("Costo_Unitario", "first"),
+                 Precio_Venta_Unitario=("Precio_Venta_Unitario", "first"), Ingresos=("Ingresos_Totales", "sum"),
+                 Utilidad=("Utilidad_Bruta", "sum"))
+        )
+        top_rentabilidad["Margen %"] = (top_rentabilidad["Utilidad"] / top_rentabilidad["Ingresos"].replace(0, pd.NA) * 100).fillna(0)
+        top_rentabilidad = top_rentabilidad.sort_values("Utilidad", ascending=False)
+
+        col_izq2, col_der2 = st.columns(2)
+        with col_izq2:
+            st.markdown("**Top 5 productos por utilidad**")
+            top5_util = top_rentabilidad.head(5)
+            fig_util = px.bar(
+                top5_util.sort_values("Utilidad", ascending=True), x="Utilidad", y="Producto", orientation="h",
+                template=tema["plotly_template"], text_auto=".2s",
+            )
+            colores_util = [ACENTO_UNIDADES if v >= 0 else ACENTO_ALERTA for v in top5_util.sort_values("Utilidad", ascending=True)["Utilidad"]]
+            fig_util.update_traces(marker_color=colores_util)
+            fig_util.update_layout(
+                paper_bgcolor=tema["chart_bg"], plot_bgcolor=tema["chart_bg"],
+                font=dict(family="Inter, sans-serif", color=tema["texto"]), margin=dict(t=10, l=10, r=10, b=10),
+                yaxis_title="", xaxis_title="Utilidad ($)",
+            )
+            st.plotly_chart(fig_util, use_container_width=True)
+        with col_der2:
+            st.markdown("**Bottom 5 productos por utilidad**")
+            bottom5_util = top_rentabilidad.tail(5)
+            fig_util_b = px.bar(
+                bottom5_util.sort_values("Utilidad", ascending=True), x="Utilidad", y="Producto", orientation="h",
+                template=tema["plotly_template"], text_auto=".2s",
+            )
+            colores_util_b = [ACENTO_UNIDADES if v >= 0 else ACENTO_ALERTA for v in bottom5_util.sort_values("Utilidad", ascending=True)["Utilidad"]]
+            fig_util_b.update_traces(marker_color=colores_util_b)
+            fig_util_b.update_layout(
+                paper_bgcolor=tema["chart_bg"], plot_bgcolor=tema["chart_bg"],
+                font=dict(family="Inter, sans-serif", color=tema["texto"]), margin=dict(t=10, l=10, r=10, b=10),
+                yaxis_title="", xaxis_title="Utilidad ($)",
+            )
+            st.plotly_chart(fig_util_b, use_container_width=True)
+
+        with st.expander("Ver tabla completa de rentabilidad por producto"):
+            tabla_r = top_rentabilidad.rename(columns={
+                "Costo_Unitario": "Costo Unitario", "Precio_Venta_Unitario": "Precio Venta Unitario",
+            })
+            st.dataframe(
+                tabla_r.style.format({
+                    "Costo Unitario": formato_pesos, "Precio Venta Unitario": formato_pesos,
+                    "Ingresos": formato_pesos, "Utilidad": formato_pesos, "Margen %": "{:.1f}%",
+                }),
+                use_container_width=True, hide_index=True,
+            )
+
+    # --- Alertas de inventario bajo (según el periodo más reciente seleccionado) ---
+    # Nota: se muestra siempre que haya datos de Inventario, sin importar si hubo ventas.
+    st.write("")
+    st.markdown("**Alertas de Inventario Bajo**", unsafe_allow_html=True)
+    periodo_reciente = [p for p in orden_periodos if p in periodos_seleccionados]
+    periodo_reciente = periodo_reciente[-1] if periodo_reciente else None
+
+    if periodo_reciente is None:
+        st.caption("Selecciona al menos un periodo para ver el inventario disponible.")
+    else:
+        df_inv_reciente = datos_por_periodo[periodo_reciente]["inventario"]
+        if df_inv_reciente is None or df_inv_reciente.empty:
+            st.caption(f"No hay datos de Inventario para {periodo_reciente}.")
+        else:
+            stock_actual = df_inv_reciente.groupby("Producto", as_index=False)["Inventario_Final"].sum()
+            stock_actual = stock_actual.sort_values("Inventario_Final", ascending=True)
+            umbral = st.slider(
+                "Umbral de unidades para alerta", min_value=0, max_value=15, value=3,
+                help=f"Se muestran los productos con Inventario Final ≤ este valor, según el periodo más reciente seleccionado ({periodo_reciente}).",
+            )
+            bajo_umbral = stock_actual[stock_actual["Inventario_Final"] <= umbral]
+            st.caption(f"Inventario de referencia: {periodo_reciente} (el más reciente entre los periodos seleccionados).")
+            if bajo_umbral.empty:
+                st.markdown(f'<div class="qa-ok">Ningún producto está en o por debajo de {umbral} unidades.</div>', unsafe_allow_html=True)
+            else:
+                st.markdown(
+                    f'<div class="qa-alert">{len(bajo_umbral)} producto(s) en o por debajo de {umbral} unidades — considera reabastecer.</div>',
+                    unsafe_allow_html=True,
+                )
+                st.dataframe(
+                    bajo_umbral.rename(columns={"Inventario_Final": "Unidades Restantes"}),
+                    use_container_width=True, hide_index=True,
+                )
+
+# --------------------------------------------------------------
 # TABLA COMPARATIVA POR PERIODO
 # --------------------------------------------------------------
 if hay_comparacion:
@@ -1319,17 +1592,15 @@ else:
         with st.chat_message("user"):
             st.markdown(pregunta)
         with st.chat_message("assistant"):
-            with st.spinner("Pensando..."):
+            with st.spinner("Consultando los datos..."):
                 try:
-                    contexto = "\n\n".join(
-                        construir_contexto_periodo(p, datos_por_periodo[p], incluir_pedidos=True)
-                        for p in periodos_seleccionados
-                    )
                     historial_para_ia = [
                         {"role": m["role"], "content": m["content"]}
                         for m in st.session_state["historial_chat_ia"][-6:-1]
                     ]
-                    respuesta = preguntar_ia(pregunta, contexto, groq_api_key, historial=historial_para_ia)
+                    respuesta = preguntar_ia_con_herramientas(
+                        pregunta, groq_api_key, periodos_seleccionados, datos_por_periodo, historial=historial_para_ia,
+                    )
                 except Exception as e:
                     respuesta = f"No se pudo consultar la IA: {e}"
                 st.markdown(respuesta)
