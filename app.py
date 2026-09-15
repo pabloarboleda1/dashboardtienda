@@ -509,6 +509,7 @@ def calcular_hoja_retribucion_fondo(df_inventario, master_fondo, tasas):
         total_vendido = fila["Total_Vendido"]
         fila["Retribucion"] = (total_vendido * tasa) if (tasa is not None and total_vendido) else 0.0
         fila["Sin_Tasa"] = tasa is None and total_vendido > 0
+        fila["Encontrado_En_Inventario"] = datos is not None
         filas.append(fila)
 
     return pd.DataFrame(filas)
@@ -536,8 +537,80 @@ def comparar_consignaciones_inventario(productos_pedidos_df, df_inventario):
 
 
 # --------------------------------------------------------------
-# EXPORTACIÓN: EXCEL DE ANÁLISIS DE FIN DE MES
+# DETECTOR DE ERRORES EN EL EXCEL
 # --------------------------------------------------------------
+TOLERANCIA_PESOS = 5  # diferencia máxima ($) tolerada antes de marcar una inconsistencia de fórmula
+TOLERANCIA_UNIDADES = 0.01
+
+def _hallazgo(periodo, tipo, severidad, producto, detalle):
+    return {"Periodo": periodo, "Tipo": tipo, "Severidad": severidad, "Producto": producto, "Detalle": detalle}
+
+
+def detectar_errores_inventario(periodo, df_inventario):
+    """Revisa un periodo de Inventario en busca de inconsistencias típicas de captura manual."""
+    hallazgos = []
+    if df_inventario is None or df_inventario.empty:
+        return hallazgos
+
+    for _, r in df_inventario.iterrows():
+        producto = r["Producto"]
+
+        # 1. Inventario final negativo (imposible)
+        if r["Inventario_Final"] < 0:
+            hallazgos.append(_hallazgo(periodo, "Inventario final negativo", "alta", producto,
+                                        f"Inventario Final = {r['Inventario_Final']:.0f} (no puede ser negativo)"))
+
+        # 2. Total Vendido vs suma de canales
+        suma_canales = r["Cantidad_Fisica"] + r["Cantidad_Online"] + r["Cantidad_Nomina"]
+        if abs(r["Total_Vendido"] - suma_canales) > TOLERANCIA_UNIDADES:
+            hallazgos.append(_hallazgo(periodo, "Total Vendido no cuadra", "alta", producto,
+                                        f"Total Vendido={r['Total_Vendido']:.0f}, pero Física+Online+Nómina={suma_canales:.0f}"))
+
+        # 3. Ingresos Totales vs Precio × Unidades vendidas
+        ingresos_esperados = r["Precio_Venta_Unitario"] * r["Total_Vendido"]
+        if r["Total_Vendido"] > 0 and abs(r["Ingresos_Totales"] - ingresos_esperados) > TOLERANCIA_PESOS:
+            hallazgos.append(_hallazgo(periodo, "Ingresos Totales no cuadra", "media", producto,
+                                        f"Registrado={formato_pesos(r['Ingresos_Totales'])}, esperado (Precio×Unidades)={formato_pesos(ingresos_esperados)}"))
+
+        # 4. Precio o costo en cero con ventas registradas
+        if r["Total_Vendido"] > 0 and r["Precio_Venta_Unitario"] <= 0:
+            hallazgos.append(_hallazgo(periodo, "Precio de venta en cero", "media", producto,
+                                        "Tiene unidades vendidas pero el Precio Venta Unitario es 0 o está vacío"))
+        if r["Total_Vendido"] > 0 and r["Costo_Unitario"] <= 0:
+            hallazgos.append(_hallazgo(periodo, "Costo unitario en cero", "media", producto,
+                                        "Tiene unidades vendidas pero el Costo Unitario es 0 o está vacío"))
+
+        # 5. Venta con pérdida (costo mayor al precio de venta)
+        if r["Costo_Unitario"] > 0 and r["Precio_Venta_Unitario"] > 0 and r["Costo_Unitario"] > r["Precio_Venta_Unitario"]:
+            hallazgos.append(_hallazgo(periodo, "Costo mayor al precio de venta", "media", producto,
+                                        f"Costo Unitario={formato_pesos(r['Costo_Unitario'])} > Precio Venta={formato_pesos(r['Precio_Venta_Unitario'])}"))
+
+        # 6. Sin Compra Origen asignada
+        if not str(r["Compra_Origen"]).strip():
+            hallazgos.append(_hallazgo(periodo, "Sin Compra Origen", "baja", producto,
+                                        "La fila no tiene un valor en 'Compra origen'"))
+
+    # 7. Productos duplicados dentro del mismo periodo
+    conteos = df_inventario["Producto"].value_counts()
+    for producto, veces in conteos[conteos > 1].items():
+        hallazgos.append(_hallazgo(periodo, "Producto duplicado", "baja", producto,
+                                    f"Aparece {int(veces)} veces en Inventario este periodo"))
+
+    return hallazgos
+
+
+def detectar_productos_fondo_ausentes(periodo, hoja_fondo):
+    """Productos de la lista maestra del Fondo que no aparecieron para nada en el Inventario de este periodo."""
+    hallazgos = []
+    if hoja_fondo is None or hoja_fondo.empty or "Encontrado_En_Inventario" not in hoja_fondo.columns:
+        return hallazgos
+    ausentes = hoja_fondo[~hoja_fondo["Encontrado_En_Inventario"]]
+    for _, r in ausentes.iterrows():
+        hallazgos.append(_hallazgo(periodo, "Producto del Fondo ausente", "baja", r["Producto"],
+                                    "No aparece en el Inventario de este periodo (ni con 0 ventas) — revisa si falta agregarlo"))
+    return hallazgos
+
+
 def _hs(cell, color=XL_COLOR_HEADER):
     cell.font = Font(name=XL_FUENTE, bold=True, color="FFFFFF", size=10)
     cell.fill = PatternFill("solid", start_color=color, end_color=color)
@@ -1244,6 +1317,53 @@ if df_filtrado.empty:
     st.stop()
 
 productos_filtrados = explotar_productos(df_filtrado)
+
+# --------------------------------------------------------------
+# DETECTOR DE ERRORES EN EL EXCEL
+# --------------------------------------------------------------
+st.markdown('<div class="section-title">Detector de Errores en el Excel</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="section-caption">Revisa el Inventario de cada periodo seleccionado buscando totales que no cuadran, '
+    'precios/costos en cero, ventas con pérdida, inventario negativo, duplicados y productos del Fondo ausentes.</div>',
+    unsafe_allow_html=True,
+)
+
+hallazgos = []
+for periodo in periodos_seleccionados:
+    datos_p = datos_por_periodo[periodo]
+    hallazgos.extend(detectar_errores_inventario(periodo, datos_p["inventario"]))
+    hallazgos.extend(detectar_productos_fondo_ausentes(periodo, datos_p.get("hoja_fondo")))
+
+if not hallazgos:
+    st.markdown('<div class="qa-ok">No se encontraron inconsistencias en el Inventario de los periodos seleccionados.</div>', unsafe_allow_html=True)
+else:
+    df_hallazgos = pd.DataFrame(hallazgos)
+    orden_severidad = {"alta": 0, "media": 1, "baja": 2}
+    df_hallazgos["_orden"] = df_hallazgos["Severidad"].map(orden_severidad)
+    df_hallazgos = df_hallazgos.sort_values(["_orden", "Periodo", "Producto"]).drop(columns="_orden")
+
+    n_alta = (df_hallazgos["Severidad"] == "alta").sum()
+    n_media = (df_hallazgos["Severidad"] == "media").sum()
+    n_baja = (df_hallazgos["Severidad"] == "baja").sum()
+
+    if n_alta > 0:
+        st.markdown(
+            f'<div class="qa-alert">{n_alta} inconsistencia(s) de alta severidad, {n_media} media(s) y {n_baja} baja(s) / informativa(s).</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            f'<div class="qa-ok">Sin errores graves — {n_media} inconsistencia(s) media(s) y {n_baja} baja(s) / informativa(s) para revisar.</div>',
+            unsafe_allow_html=True,
+        )
+
+    etiqueta_severidad = {"alta": "🔴 Alta", "media": "🟡 Media", "baja": "⚪ Baja / informativa"}
+    df_mostrar_hallazgos = df_hallazgos.copy()
+    df_mostrar_hallazgos["Severidad"] = df_mostrar_hallazgos["Severidad"].map(etiqueta_severidad)
+    with st.expander(f"Ver el detalle de los {len(df_hallazgos)} hallazgo(s)", expanded=n_alta > 0):
+        st.dataframe(df_mostrar_hallazgos, use_container_width=True, hide_index=True)
+
+st.write("")
 
 # --------------------------------------------------------------
 # KPIs
