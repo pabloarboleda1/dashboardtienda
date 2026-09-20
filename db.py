@@ -13,7 +13,7 @@ Funciona con:
 """
 
 import streamlit as st
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, inspect, text, UniqueConstraint
 from sqlalchemy.orm import sessionmaker
 
 from models import Base, TasaRetribucion, CATEGORIAS_RETRIBUCION
@@ -33,8 +33,65 @@ def obtener_database_url():
 def obtener_engine(database_url):
     engine = create_engine(database_url, pool_pre_ping=True)
     Base.metadata.create_all(engine)
+    _migrar_columnas_faltantes(engine)
+    _migrar_restricciones_unicas(engine)
     _sembrar_tasas_iniciales(engine)
     return engine
+
+
+def _migrar_columnas_faltantes(engine):
+    """Si el modelo (models.py) tiene columnas que la tabla real todavía no tiene
+    (porque la tabla ya existía de antes de agregarlas), las agrega con ALTER TABLE.
+    Así no hay que borrar/recrear la base de datos cada vez que evoluciona el esquema."""
+    inspector = inspect(engine)
+    for tabla in Base.metadata.tables.values():
+        if not inspector.has_table(tabla.name):
+            continue  # tabla nueva: create_all ya la crea completa
+        columnas_existentes = {c["name"] for c in inspector.get_columns(tabla.name)}
+        for columna in tabla.columns:
+            if columna.name in columnas_existentes:
+                continue
+            tipo_sql = columna.type.compile(dialect=engine.dialect)
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(f'ALTER TABLE "{tabla.name}" ADD COLUMN "{columna.name}" {tipo_sql}'))
+            except Exception as e:
+                st.warning(f"No se pudo agregar la columna '{columna.name}' a '{tabla.name}': {e}")
+
+
+def _migrar_restricciones_unicas(engine):
+    """Si cambió qué columnas forman la restricción 'única' de una tabla (ej. productos
+    pasó de (nombre, talla) a (nombre, talla, compra_origen)), tumba la restricción vieja
+    y crea la nueva. Best-effort: si algo falla, solo avisa, no rompe la app."""
+    inspector = inspect(engine)
+    for tabla in Base.metadata.tables.values():
+        if not inspector.has_table(tabla.name):
+            continue
+        esperadas = [c for c in tabla.constraints if isinstance(c, UniqueConstraint)]
+        if not esperadas:
+            continue
+        try:
+            actuales = inspector.get_unique_constraints(tabla.name)
+        except Exception:
+            continue
+        for restriccion in esperadas:
+            columnas_esperadas = set(col.name for col in restriccion.columns)
+            if any(set(r["column_names"]) == columnas_esperadas for r in actuales):
+                continue  # ya está tal cual la necesitamos
+            for r in actuales:
+                if set(r["column_names"]).issubset(columnas_esperadas) and r["column_names"]:
+                    try:
+                        with engine.begin() as conn:
+                            conn.execute(text(f'ALTER TABLE "{tabla.name}" DROP CONSTRAINT "{r["name"]}"'))
+                    except Exception as e:
+                        st.warning(f"No se pudo quitar la restricción vieja '{r['name']}': {e}")
+            nombre_restriccion = restriccion.name or f"uq_{tabla.name}_{'_'.join(sorted(columnas_esperadas))}"
+            cols_sql = ", ".join(f'"{c}"' for c in columnas_esperadas)
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(f'ALTER TABLE "{tabla.name}" ADD CONSTRAINT "{nombre_restriccion}" UNIQUE ({cols_sql})'))
+            except Exception as e:
+                st.warning(f"No se pudo crear la restricción única en '{tabla.name}': {e}")
 
 
 def _sembrar_tasas_iniciales(engine):
@@ -64,10 +121,12 @@ def obtener_sesion():
 
 
 def probar_conexion(database_url):
-    """Intenta conectar y crear las tablas; devuelve (True, None) o (False, mensaje_error)."""
+    """Intenta conectar y crear/migrar las tablas; devuelve (True, None) o (False, mensaje_error)."""
     try:
         engine = create_engine(database_url, pool_pre_ping=True)
         Base.metadata.create_all(engine)
+        _migrar_columnas_faltantes(engine)
+        _migrar_restricciones_unicas(engine)
         _sembrar_tasas_iniciales(engine)
         with engine.connect():
             pass
