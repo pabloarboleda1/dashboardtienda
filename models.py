@@ -10,7 +10,7 @@ se toca según cuál elijas.
 
 from datetime import datetime, date
 
-from sqlalchemy import Column, Integer, String, Float, Date, DateTime, ForeignKey, UniqueConstraint
+from sqlalchemy import Column, Integer, String, Float, Date, DateTime, ForeignKey, UniqueConstraint, Text
 from sqlalchemy.orm import relationship, declarative_base
 
 Base = declarative_base()
@@ -34,10 +34,11 @@ class Producto(Base):
     costo_unitario = Column(Float, default=0.0)
     precio_venta_unitario = Column(Float, default=0.0)
     stock_actual = Column(Integer, default=0)
+    imagen_base64 = Column(Text, default=None)  # imagen codificada en base64 (JPEG/PNG pequeños)
     activo = Column(Integer, default=1)  # 1 = activo, 0 = descontinuado (no se borra, se oculta)
     creado_en = Column(DateTime, default=datetime.utcnow)
 
-    __table_args__ = (UniqueConstraint("nombre", "talla", name="uq_producto_talla"),)
+    __table_args__ = (UniqueConstraint("nombre", "talla", "compra_origen", name="uq_producto_talla_origen"),)
 
     ventas = relationship("Venta", back_populates="producto")
     compras = relationship("Compra", back_populates="producto")
