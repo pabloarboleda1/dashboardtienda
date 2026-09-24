@@ -24,6 +24,7 @@ paginas = [
     st.Page("paginas/reporte_ventas.py", title="Reporte de Ventas", icon="📊", default=True),
     st.Page("paginas/catalogo_productos.py", title="Catálogo de Productos", icon="🏷️"),
     st.Page("paginas/registrar_venta.py", title="Registro de Ventas", icon="📝"),
+    st.Page("paginas/exportar_reporte.py", title="Exportar Reporte", icon="📤"),
 ]
 
 navegacion = st.navigation(paginas, position="sidebar")
